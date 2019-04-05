@@ -4,6 +4,8 @@ from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.ext.hybrid import hybrid_property
 
+from mqttclient import MQTTClient
+
 from wtforms import validators
 
 import flask_admin as admin
@@ -14,6 +16,7 @@ from flask_admin.contrib.sqla.form import InlineModelConverter
 from flask_admin.contrib.sqla.fields import InlineModelFormList
 from flask_admin.contrib.sqla.filters import BaseSQLAFilter, FilterEqual
 
+from tah_admin import TahModelView
 
 # Create application
 app = Flask(__name__)
@@ -21,16 +24,20 @@ app = Flask(__name__)
 # set optional bootswatch theme
 # see http://bootswatch.com/3/ for available swatches
 app.config['FLASK_ADMIN_SWATCH'] = 'cerulean'
-
+app.config['DEBUG'] = True
 # Create dummy secrey key so we can use sessions
 app.config['SECRET_KEY'] = '123456790'
 
 # Create in-memory database
 app.config['DATABASE_FILE'] = 'sample_db.sqlite'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + app.config['DATABASE_FILE']
-app.config['SQLALCHEMY_ECHO'] = True
+#app.config['SQLALCHEMY_ECHO'] = True
+
+
 db = SQLAlchemy(app)
 
+app.config['MQTT_SERVER'] = 'iot.eclipse.org'
+app.config['MQTT_PORT'] = 1883
 
 # Create models
 class User(db.Model):
@@ -45,7 +52,29 @@ class User(db.Model):
 
     def __repr__(self):
         return "{}: {}".format(self.id, self.__str__())
+ 
+def listens_for(mapper, connection, target, event_type):
 
+    topic = f'{mapper.local_table}'
+    payload = f'{event_type[0]} {target.id}'
+    app.logger.debug(f'publish {topic}, {payload}')
+    MQTTClient.publish(topic, payload=payload) #, qos=1, retain=False)
+    MQTTClient.publish_payloads()
+    
+@db.event.listens_for(User, "after_insert")
+def after_insert(mapper, connection, target):
+    listens_for(mapper, connection, target, event_type='insert')
+    
+@db.event.listens_for(User, "after_update")
+def after_update(mapper, connection, target):
+    listens_for(mapper, connection, target, event_type='update')
+    
+@db.event.listens_for(User, "after_delete")
+def after_delete(mapper, connection, target):
+    listens_for(mapper, connection, target, event_type='delete')
+
+app.logger.debug('TEST')
+        
 
 class Pet(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -147,7 +176,29 @@ inline_form_options = {
     'form_extra_fields': None,
 }
 
-class UserAdmin(sqla.ModelView):
+class TagAdmin(TahModelView):
+    page_size = False
+    column_display_pk = True
+    column_list = [
+        'id',
+        'name'
+    ]
+    column_editable_list = [ 'name']
+    def __init__(self, session):
+        # Just call parent class with predefined model.
+        super(TagAdmin, self).__init__(Tag, session)
+
+
+        
+class UserAdmin(TahModelView):
+    column_default_sort = 'id'
+    extra_js = [ 
+        '//cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/paho-mqtt.min.js', 
+        '//cdnjs.cloudflare.com/ajax/libs/jquery-color/2.1.2/jquery.color.min.js',
+        '/static/js/mq.js',
+        '/static/js/admin-style.js',]
+    extra_css = [ '/static/css/admin-style.css']
+    page_size = False
     action_disallowed_list = ['delete', ]
     column_display_pk = True
     column_list = [
@@ -157,7 +208,14 @@ class UserAdmin(sqla.ModelView):
         'email',
         'pets',
     ]
-    column_default_sort = [('last_name', False), ('first_name', False)]  # sort on multiple columns
+    column_editable_list = [
+        #'id',
+        'last_name',
+        'first_name',
+        'email',
+        'pets',
+    ]
+    #column_default_sort = [('last_name', False), ('first_name', False)]  # sort on multiple columns
 
     # custom filter: each filter in the list is a filter operation (equals, not equals, etc)
     # filters with the same name will appear as operations under the same filter
@@ -190,7 +248,7 @@ class UserAdmin(sqla.ModelView):
 
 
 # Customized Post model admin
-class PostAdmin(sqla.ModelView):
+class PostAdmin(TahModelView):
     column_list = ['id', 'user', 'title', 'date', 'tags']
     column_default_sort = ('date', True)
     column_sortable_list = [
@@ -246,11 +304,11 @@ class PostAdmin(sqla.ModelView):
         super(PostAdmin, self).__init__(Post, session)
 
 
-class TreeView(sqla.ModelView):
+class TreeView(TahModelView):
     form_excluded_columns = ['children', ]
 
 
-class ScreenView(sqla.ModelView):
+class ScreenView(TahModelView):
     column_list = ['id', 'width', 'height', 'number_of_pixels']  # not that 'number_of_pixels' is a hybrid property, not a field
     column_sortable_list = ['id', 'width', 'height', 'number_of_pixels']
 
@@ -263,10 +321,12 @@ admin = admin.Admin(app, name='Example: SQLAlchemy', template_mode='bootstrap3')
 
 # Add views
 admin.add_view(UserAdmin(User, db.session))
-admin.add_view(sqla.ModelView(Tag, db.session))
+#admin.add_view(TahModelView(Tag, db.session))
+admin.add_view(TagAdmin(db.session))
+
 admin.add_view(PostAdmin(db.session))
-admin.add_view(sqla.ModelView(Pet, db.session, category="Other"))
-admin.add_view(sqla.ModelView(UserInfo, db.session, category="Other"))
+admin.add_view(TahModelView(Pet, db.session, category="Other"))
+admin.add_view(TahModelView(UserInfo, db.session, category="Other"))
 admin.add_view(TreeView(Tree, db.session, category="Other"))
 admin.add_view(ScreenView(Screen, db.session, category="Other"))
 admin.add_sub_category(name="Links", parent_name="Other")
@@ -399,5 +459,9 @@ if __name__ == '__main__':
     if not os.path.exists(database_path):
         build_sample_db()
 
+    with app.app_context():
+        MQTTClient.create_client()
+
     # Start app
-    app.run(debug=True)
+    app.run(debug=True, port=8080, host='0.0.0.0')
+
